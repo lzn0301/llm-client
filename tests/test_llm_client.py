@@ -14,7 +14,31 @@ from llm_client import (
     clean_json_text,
     extract_json_block,
     is_retriable_error,
+    parse_api_key_list,
+    sanitize_api_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch):
+    """Prevent tests from reading the user's real ~/.config/llm-client/.env or shell keys."""
+    monkeypatch.setenv("LLM_CLIENT_ENV_FILE", "")
+    for var in (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_FREE_API_KEYS",
+        "GEMINI_PAID_API_KEY",
+        "GEMINI_PAID_API_KEYS",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "LLM_ROUTING_MODE",
+        "LLM_PROVIDER",
+        "LLM_FALLBACK_BASE_URL",
+        "OPENAI_BASE_URL",
+        "LLM_FALLBACK_MODEL",
+        "OPENAI_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
 
 class _DummyPart:
@@ -280,3 +304,149 @@ def test_offline_mock_handler():
     assert client.is_configured is False
     assert client.generate("hi") == "mock text"
     assert client.generate_json("hi") == {"mock": True}
+
+
+def test_placeholder_key_sanitization():
+    assert sanitize_api_key("your-openai-api-key") == ""
+    assert sanitize_api_key("your_gemini_api_key_here") == ""
+    assert sanitize_api_key("xxxxx") == ""
+    assert sanitize_api_key("<API_KEY>") == ""
+    assert sanitize_api_key("   ") == ""
+    assert sanitize_api_key("test-gemini-key") == "test-gemini-key"
+    assert parse_api_key_list("k1, your-key-here , k2, k1, xxxxx") == ["k1", "k2"]
+
+    # Placeholder OPENAI_API_KEY must be ignored as cross-provider fallback
+    client = LLMClient(api_key="real-gemini-key", fallback_api_key="your-openai-api-key")
+    assert client.fallback_api_key == ""
+
+
+def test_global_env_and_routing_modes(tmp_path, monkeypatch):
+    global_env = tmp_path / ".env"
+    global_env.write_text(
+        "GEMINI_FREE_API_KEYS=free-key-1,free-key-2\n"
+        "GEMINI_PAID_API_KEY=paid-key-1\n"
+        "DEEPSEEK_API_KEY=ds-key-1\n"
+        "LLM_ROUTING_MODE=free_first\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_CLIENT_ENV_FILE", str(global_env))
+    # Prevent python-dotenv from loading workspace .env in cwd during this test
+    monkeypatch.setattr("llm_client.env.load_project_dotenv", lambda: None)
+
+    c_free_first = LLMClient()
+    assert c_free_first.routing_mode == "free_first"
+    assert c_free_first.api_key == "free-key-1"
+    assert c_free_first.gemini_key_tiers == ["free", "free", "paid"]
+    assert c_free_first.fallback_api_key == "ds-key-1"
+
+    # Project env LLM_ROUTING_MODE overrides global LLM_ROUTING_MODE while inheriting keys
+    monkeypatch.setenv("LLM_ROUTING_MODE", "paid_first")
+    c_paid_first = LLMClient()
+    assert c_paid_first.routing_mode == "paid_first"
+    assert c_paid_first.api_key == "paid-key-1"
+    assert c_paid_first.gemini_key_tiers == ["paid", "free", "free"]
+
+    # free_only / paid_only isolation
+    assert LLMClient(routing_mode="free_only").gemini_key_tiers == ["free", "free"]
+    assert LLMClient(routing_mode="paid_only").gemini_key_tiers == ["paid"]
+
+    # Explicit project GEMINI_API_KEY overrides global pool
+    monkeypatch.setenv("GEMINI_API_KEY", "project-override-key")
+    c_override = LLMClient()
+    assert c_override.api_key == "project-override-key"
+    assert c_override.gemini_key_tiers == ["env"]
+
+
+def test_free_first_failover_to_paid_then_deepseek():
+    recorded: list[UsageRecord] = []
+    client = LLMClient(
+        free_api_keys="free-key",
+        paid_api_key="paid-key",
+        fallback_api_key="ds-key",
+        routing_mode="free_first",
+        max_retries_per_model=1,
+        retry_backoff_s=0,
+        usage_callback=recorded.append,
+    )
+    mock_free = MagicMock()
+    mock_paid = MagicMock()
+    client._gemini_entries[0]["client"] = mock_free
+    client.client = mock_free
+    client._gemini_entries[1]["client"] = mock_paid
+
+    # Free key hits 403 billing/quota -> quickly escalates to Paid key and succeeds
+    mock_free.models.generate_content.side_effect = RuntimeError("403 PERMISSION_DENIED: quota exceeded")
+    mock_paid.models.generate_content.return_value = _DummyResponse(text="paid tier ok")
+
+    assert client.generate("Hello", tier="flash") == "paid tier ok"
+    assert recorded[-1].metadata.get("key_tier") == "paid"
+    assert mock_free.models.generate_content.call_count == 1  # Fast-failed across key tier on 403
+    assert mock_paid.models.generate_content.call_count == 1
+
+    # Now Paid key also exhausts -> falls back to DeepSeek
+    mock_paid.models.generate_content.side_effect = RuntimeError("503 UNAVAILABLE")
+    mock_http_resp = MagicMock()
+    mock_http_resp.status_code = 200
+    mock_http_resp.json.return_value = {
+        "choices": [{"message": {"content": "deepseek ok"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 4},
+    }
+    with patch("llm_client.client.httpx.Client") as mock_http_cls:
+        mock_http_cls.return_value.__enter__.return_value.post.return_value = mock_http_resp
+        assert client.generate("Hello again", tier="flash") == "deepseek ok"
+    assert recorded[-1].provider == "openai_compatible"
+
+
+def test_generate_images_key_tier_failover():
+    recorded: list[UsageRecord] = []
+    client = LLMClient(
+        free_api_keys="free-key",
+        paid_api_key="paid-key",
+        routing_mode="free_first",
+        max_retries_per_model=1,
+        retry_backoff_s=0,
+        usage_callback=recorded.append,
+    )
+    mock_free = MagicMock()
+    mock_paid = MagicMock()
+    client._gemini_entries[0]["client"] = mock_free
+    client.client = mock_free
+    client._gemini_entries[1]["client"] = mock_paid
+
+    mock_free.models.generate_content.side_effect = RuntimeError("403 PERMISSION_DENIED: image model requires billing")
+    mock_paid.models.generate_content.return_value = _DummyResponse(text=None, image_bytes=b"\x89PNG\r\npaid")
+
+    img = client.generate_image("Lotus crystal bracelet")
+    assert img == b"\x89PNG\r\npaid"
+    assert recorded[-1].metadata.get("key_tier") == "paid"
+
+
+def test_chat_session_key_tier_failover():
+    client = LLMClient(
+        free_api_keys="free-key",
+        paid_api_key="paid-key",
+        routing_mode="free_first",
+        max_retries_per_model=1,
+        retry_backoff_s=0,
+    )
+    mock_free = MagicMock()
+    mock_paid = MagicMock()
+    client._gemini_entries[0]["client"] = mock_free
+    client.client = mock_free
+    client._gemini_entries[1]["client"] = mock_paid
+
+    failing_chat = MagicMock()
+    failing_chat.get_history.return_value = []
+    failing_chat.send_message.side_effect = RuntimeError("403 PERMISSION_DENIED: API key quota exhausted")
+
+    healthy_paid_chat = MagicMock()
+    healthy_paid_chat.get_history.return_value = []
+    healthy_paid_chat.send_message.return_value = _DummyResponse(text="paid chat reply ok")
+
+    mock_free.chats.create.return_value = failing_chat
+    mock_paid.chats.create.return_value = healthy_paid_chat
+
+    chat = client.create_chat(system_instruction="Help", tier="flash")
+    resp = chat.send_message("Hello")
+    assert resp.text == "paid chat reply ok"
+    assert chat.key_tier == "paid"

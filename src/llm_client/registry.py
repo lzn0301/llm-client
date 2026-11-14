@@ -34,6 +34,7 @@ DEFAULT_REGISTRY: Dict[str, Any] = {
             "gemini-4-carbon",
             "gemini-3.8-flash",
             "deepseek-reasoner",
+            "deepseek-v4-pro",
             "deepseek-chat",
         ],
         "image": [

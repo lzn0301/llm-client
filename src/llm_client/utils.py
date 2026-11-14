@@ -1,8 +1,75 @@
-"""Utility helpers for JSON cleaning/extraction and error classification."""
+"""Utility helpers for JSON cleaning/extraction, key sanitization, and error classification."""
 
 import json
 import re
-from typing import Optional
+from typing import Any, List, Optional
+
+
+_PLACEHOLDER_EXACT = {
+    "none",
+    "null",
+    "undefined",
+    "changeme",
+    "todo",
+    "empty",
+    "your_api_key",
+    "your-api-key",
+    "api_key",
+    "api-key",
+}
+
+_PLACEHOLDER_PREFIXES = (
+    "your-",
+    "your_",
+    "insert-",
+    "insert_",
+    "replace-",
+    "replace_",
+    "placeholder",
+    "example-",
+    "example_",
+)
+
+
+def sanitize_api_key(raw: Optional[str]) -> str:
+    """Return stripped API key, or '' if empty or an obvious placeholder template."""
+    if not raw or not isinstance(raw, str):
+        return ""
+    cleaned = raw.strip().strip('"').strip("'").strip()
+    if not cleaned:
+        return ""
+
+    lower = cleaned.lower()
+    if lower in _PLACEHOLDER_EXACT or lower.startswith(_PLACEHOLDER_PREFIXES):
+        return ""
+    if (cleaned.startswith("<") and cleaned.endswith(">")) or (
+        cleaned.startswith("[") and cleaned.endswith("]")
+    ):
+        return ""
+    # Reject repeated junk strings like 'xxxxx', '00000', '...'
+    if len(cleaned) >= 3 and len(set(lower)) <= 2:
+        return ""
+
+    return cleaned
+
+
+def parse_api_key_list(raw: Any) -> List[str]:
+    """Parse a comma/semicolon-separated string or sequence into unique sanitized API keys."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = re.split(r"[,;\n]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(item) for item in raw if item is not None]
+    else:
+        parts = [str(raw)]
+
+    result: List[str] = []
+    for part in parts:
+        cleaned = sanitize_api_key(part)
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
 
 
 def clean_json_text(text: str) -> str:
