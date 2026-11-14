@@ -1,5 +1,6 @@
 """Utility helpers for JSON cleaning/extraction and error classification."""
 
+import json
 import re
 from typing import Optional
 
@@ -9,8 +10,8 @@ def clean_json_text(text: str) -> str:
     if not text:
         return ""
     cleaned = text.strip()
-    fence_match = re.match(r"^```(?:json|JSON)?\s*\n?(.*?)\n?```\s*$", cleaned, flags=re.DOTALL)
-    if fence_match:
+    fence_match = re.search(r"```(?:json|JSON)?\s*\n?(.*?)\n?```", cleaned, flags=re.DOTALL)
+    if fence_match and cleaned.startswith("```"):
         return fence_match.group(1).strip()
     if cleaned.startswith("```json"):
         cleaned = cleaned[len("```json"):]
@@ -23,54 +24,35 @@ def clean_json_text(text: str) -> str:
 
 def extract_json_block(text: str) -> Optional[str]:
     """
-    Extract the first balanced JSON object ({...}) or array ([...]) from text.
-    Handles string literals and escaped quotes safely.
+    Extract the first valid JSON object ({...}) or array ([...]) from text.
+    Safely handles surrounding markdown fences, prose, and bracketed prefixes like '[Note]'.
     """
     if not text:
         return None
 
-    cleaned = clean_json_text(text)
-    if not cleaned:
+    stripped = text.strip()
+    fence_match = re.search(r"```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```", stripped)
+    inner = fence_match.group(1).strip() if fence_match else clean_json_text(stripped)
+    if not inner:
         return None
 
-    start_idx = -1
-    open_char = ""
-    close_char = ""
-    for idx, ch in enumerate(cleaned):
-        if ch == "{":
-            start_idx = idx
-            open_char, close_char = "{", "}"
-            break
-        if ch == "[":
-            start_idx = idx
-            open_char, close_char = "[", "]"
-            break
+    try:
+        parsed = json.loads(inner)
+        if isinstance(parsed, (dict, list)):
+            return inner
+    except Exception:
+        pass
 
-    if start_idx == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start_idx, len(cleaned)):
-        ch = cleaned[idx]
-        if escape:
-            escape = False
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(inner):
+        if ch not in ("{", "["):
             continue
-        if ch == "\\" and in_string:
-            escape = True
+        try:
+            obj, end_pos = decoder.raw_decode(inner, idx)
+            if isinstance(obj, (dict, list)):
+                return inner[idx:end_pos]
+        except Exception:
             continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == open_char:
-            depth += 1
-        elif ch == close_char:
-            depth -= 1
-            if depth == 0:
-                return cleaned[start_idx : idx + 1]
 
     return None
 

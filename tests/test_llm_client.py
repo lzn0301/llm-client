@@ -58,6 +58,9 @@ def test_clean_and_extract_json():
     arr_raw = "Prefix text [1, 2, {\"a\": 3}] suffix text"
     assert extract_json_block(arr_raw) == '[1, 2, {"a": 3}]'
 
+    bracket_prefix = '[OPC Analysis] 评审结果如下：\n{"evaluations": [{"score": 9.0}]}'
+    assert extract_json_block(bracket_prefix) == '{"evaluations": [{"score": 9.0}]}'
+
 
 def test_error_classification():
     assert is_retriable_error(RuntimeError("503 UNAVAILABLE: high demand")) is True
