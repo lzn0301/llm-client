@@ -15,7 +15,7 @@
 本地开发可编辑安装：
 
 ```bash
-pip install -e d:\ai_agent_project\llm-client
+pip install -e ../llm-client
 ```
 
 或从 GitHub 安装：
