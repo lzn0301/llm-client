@@ -73,12 +73,14 @@ def test_error_classification():
 def test_registry_resolution_and_remote_override():
     registry = ModelRegistry()
     flash_candidates = registry.resolve_candidates(tier="flash")
-    assert flash_candidates[0] == "gemini-3.8-flash"
+    assert flash_candidates[0] == "gemini-4-hydrogen"
+    assert "gemini-3.8-flash" in flash_candidates
     assert "deepseek-chat" in flash_candidates
 
     # Concrete deprecated model keeps requested model first, then appends tier backups
     legacy_candidates = registry.resolve_candidates(model="models/gemini-2.5-flash")
     assert legacy_candidates[0] == "gemini-2.5-flash"
+    assert "gemini-4-hydrogen" in legacy_candidates
     assert "gemini-3.8-flash" in legacy_candidates
     assert "gemini-3.5-flash-lite" in legacy_candidates
 
@@ -121,7 +123,7 @@ def test_generate_parameter_compatibility_and_timeout_injection():
     )
     assert result == "hello world"
     call_kwargs = mock_genai_client.models.generate_content.call_args.kwargs
-    assert call_kwargs["model"] == "gemini-3.8-flash"
+    assert call_kwargs["model"] == "gemini-4-hydrogen"
     assert call_kwargs["contents"] == "Say hi"
     assert call_kwargs["config"].system_instruction == "Be concise"
     assert call_kwargs["config"].temperature == 0.25
@@ -129,7 +131,7 @@ def test_generate_parameter_compatibility_and_timeout_injection():
 
     assert len(recorded) == 1
     assert recorded[0].step_name == "unit_test_step"
-    assert recorded[0].model == "gemini-3.8-flash"
+    assert recorded[0].model == "gemini-4-hydrogen"
     assert recorded[0].provider == "gemini"
     assert recorded[0].input_tokens == 10
     assert recorded[0].output_tokens == 20
@@ -147,19 +149,19 @@ def test_generate_fallback_on_503_and_timeout():
     mock_genai_client = MagicMock()
 
     def _side_effect(model, contents, config):
-        if model == "gemini-3.8-flash":
+        if model == "gemini-4-hydrogen":
             raise RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand.")
-        return _DummyResponse(text="recovered on lite", prompt_tokens=15, output_tokens=25)
+        return _DummyResponse(text="recovered on 3.8 flash", prompt_tokens=15, output_tokens=25)
 
     mock_genai_client.models.generate_content.side_effect = _side_effect
     client.client = mock_genai_client
 
     out = client.generate("Ping", tier="flash", step_name="fallback_test")
-    assert out == "recovered on lite"
-    # First model tried twice, then switched to gemini-3.5-flash-lite
+    assert out == "recovered on 3.8 flash"
+    # First model tried twice, then switched to gemini-3.8-flash
     called_models = [c.kwargs["model"] for c in mock_genai_client.models.generate_content.call_args_list]
-    assert called_models == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
-    assert recorded[-1].model == "gemini-3.5-flash-lite"
+    assert called_models == ["gemini-4-hydrogen", "gemini-4-hydrogen", "gemini-3.8-flash"]
+    assert recorded[-1].model == "gemini-3.8-flash"
 
 
 def test_generate_cross_provider_deepseek_fallback():
@@ -266,7 +268,7 @@ def test_chat_session_fallback():
     chat = client.create_chat(system_instruction="Help", tier="flash")
     resp = chat.send_message("Hello")
     assert resp.text == "chat reply ok"
-    assert chat.model == "gemini-3.5-flash-lite"
+    assert chat.model == "gemini-3.8-flash"
 
 
 def test_offline_mock_handler():
